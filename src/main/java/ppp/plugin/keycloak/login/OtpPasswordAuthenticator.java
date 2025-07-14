@@ -76,10 +76,6 @@ public class OtpPasswordAuthenticator extends AbstractDirectGrantAuthenticator {
   }
 
   private boolean restCall(String url, String mobileNo, String otp) {
-    // TODO: remove below logic if external api is working fine
-    if ("111111".equals(otp)) {
-      return true;
-    }
     try {
       HttpClient client = HttpClient.newHttpClient();
       String jsonRequest = String.format("{ \"otp\": \"%s\", \"username\": \"%s\" }", otp, mobileNo);
