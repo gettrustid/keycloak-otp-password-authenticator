@@ -1,0 +1,66 @@
+# Managed by terraform (infra-terraform/github/modules/soc2-repo).
+# Do not edit here - changes will be overwritten on the next apply.
+name: Enforce dev to main
+
+on:
+  pull_request:
+    branches:
+      - main
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  enforce-source:
+    name: Enforce dev to main
+    runs-on: ubuntu-latest
+    # pull_request_review fires for reviews on any PR (no branches filter
+    # available on that event). Guard so we only enforce when the PR
+    # actually targets the protected branch.
+    if: github.event.pull_request.base.ref == 'main'
+    steps:
+      - name: Verify source branch or hotfix/release approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          EXPECTED: dev
+        run: |
+          set -euo pipefail
+
+          if [ "$HEAD_REF" = "$EXPECTED" ]; then
+            echo "Source '$HEAD_REF' -> '$BASE_REF' allowed (standard promotion)."
+            exit 0
+          fi
+
+          case "$HEAD_REF" in
+            hotfix/*|release/*)
+              echo "Source '$HEAD_REF' is a hotfix/release branch; checking for admin/maintain approval..."
+              approvers=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+                --jq '[.[] | select(.state == "APPROVED") | .user.login] | unique | .[]' || true)
+              if [ -z "$approvers" ]; then
+                echo "::error::hotfix/release PR requires an APPROVED review from a repo admin or maintainer. No approving reviews found."
+                exit 1
+              fi
+              for user in $approvers; do
+                perm=$(gh api "repos/$REPO/collaborators/$user/permission" --jq '.permission' 2>/dev/null || echo "none")
+                echo "Reviewer '$user' repo permission: $perm"
+                if [ "$perm" = "admin" ] || [ "$perm" = "maintain" ]; then
+                  echo "Bypass granted: approving review from '$user' (permission: $perm)."
+                  exit 0
+                fi
+              done
+              echo "::error::hotfix/release PR requires an APPROVED review from a user with 'admin' or 'maintain' permission. Current approvers do not qualify."
+              exit 1
+              ;;
+          esac
+
+          echo "::error::PRs into '$BASE_REF' must originate from '$EXPECTED'."
+          echo "::error::Exceptions: 'hotfix/*' or 'release/*' branches, when approved by a repo admin/maintainer."
+          echo "::error::Got head '$HEAD_REF'."
+          exit 1

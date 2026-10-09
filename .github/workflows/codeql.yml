@@ -1,0 +1,80 @@
+# Managed by terraform (infra-terraform/github/modules/soc2-repo).
+# Do not edit here - changes will be overwritten on the next apply.
+#
+# SOC2 fleet-standard CodeQL configuration.
+# See modules/soc2-repo/codeql.tf for rationale + evidence anchors.
+#
+# Query suite: security-and-quality
+#   - security-and-quality: balanced signal / false-positive rate (default)
+#   - security-extended:    higher recall, more triage burden
+#
+# Normative: OpenSSF Scorecard SAST (Medium risk)
+#            NIST SP 800-218 v1.1 PW.7 + PW.8
+name: CodeQL
+
+on:
+  push:
+    branches: ["main", "dev"]
+  pull_request:
+    branches: ["main", "dev"]
+  schedule:
+    # Weekly, staggered off-hour to avoid runner contention with the
+    # dependabot cadence (Mon 06:00 UTC). Matches tracer-kafka's existing
+    # CodeQL schedule.
+    - cron: "17 4 * * 1"
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  analyze:
+    name: CodeQL Analysis (${{ matrix.language }})
+    # Skip on Dependabot-authored PRs — the diff is package.json /
+    # package-lock.json (npm) or workflow `uses:` fields (github-actions),
+    # neither of which changes source that CodeQL can meaningfully
+    # analyze. The `push` trigger on main/dev fires
+    # immediately after Dependabot merges, covering the SOC2 CC7.1
+    # detection ask with zero information loss. Workflow-security supply-
+    # chain risk (github-actions ecosystem) is covered separately by
+    # poutine (see poutine.tf). Human PRs still run through this job.
+    if: github.event_name != 'pull_request' || github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - "java-kotlin"
+          - "actions"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          # security-and-quality is the fleet default; some repos may
+          # override via var.codeql_query_suite to security-extended.
+          queries: security-and-quality
+
+      # Autobuild handles the common cases:
+      #   - javascript-typescript / python / ruby: no-op (source-traced)
+      #   - go / java-kotlin / csharp: runs the standard build for the
+      #     language so CodeQL can extract compiled artifacts.
+      # Repos with unusual build systems should set enable_codeql = false
+      # in tfvars and maintain a hand-authored workflow instead.
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+          # SARIF upload to the Security tab is default-on for the action;
+          # kept explicit for clarity.
+          upload: true

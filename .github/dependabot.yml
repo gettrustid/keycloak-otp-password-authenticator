@@ -1,0 +1,33 @@
+# Managed by terraform (infra-terraform/github/modules/soc2-repo).
+# Do not edit here - changes will be overwritten on the next apply.
+#
+# SOC2 fleet-standard Dependabot configuration.
+# See modules/soc2-repo/dependabot.tf for rationale + evidence anchors.
+#
+# Cooldown: GitHub Changelog 2026-07-14 (default 3d, security-exempt)
+# Grouping: GitHub Changelog 2024-03-28 (grouped security updates GA)
+# Normative: OpenSSF Scorecard Dependency-Update-Tool (High risk)
+#            NIST SP 800-218 v1.1 PW.4.4
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "github-actions"]
+    reviewers:
+      - "gettrustid/security"
+    cooldown:
+      default-days: 3
+    groups:
+      gha-all:
+        applies-to: version-updates
+        patterns: ["*"]
+      gha-security:
+        applies-to: security-updates
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
