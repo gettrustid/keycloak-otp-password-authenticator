@@ -72,9 +72,13 @@ jobs:
         uses: github/codeql-action/autobuild@v3
 
       - name: Perform CodeQL Analysis
+        id: codeql-analyze
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:${{ matrix.language }}"
           # SARIF upload to the Security tab is default-on for the action;
           # kept explicit for clarity.
           upload: true
+          # Explicit output path so the gate step below can parse the SARIF.
+          output: sarif-results
+
