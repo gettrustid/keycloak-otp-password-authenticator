@@ -1,0 +1,49 @@
+# Managed by terraform (infra-terraform/github/modules/soc2-repo).
+# Do not edit here - changes will be overwritten on the next apply.
+#
+# Fleet-standard CODEOWNERS. See modules/soc2-repo/codeowners.tf for
+# rationale + evidence anchors.
+#
+# Syntax: last-match wins. Specific paths below override earlier globs when
+# both apply, so order matters. Keep repo-specific additions under
+# codeowners_extra and let them layer on top of the fleet defaults.
+
+# CI/CD workflows and composite actions — platform owns; security co-reviews.
+# Pipeline config is code (NIST SP 800-218 PS.1); PR gating here is the
+# primary control against the INC-2026-09-17 class of supply-chain hijacks.
+/.github/workflows/**            @gettrustid/platform @gettrustid/security
+/.github/actions/**              @gettrustid/platform @gettrustid/security
+
+# Dependabot config — security owns the dependency-update policy.
+/.github/dependabot.yml          @gettrustid/security
+
+# This file — security owns its own access list.
+/.github/CODEOWNERS              @gettrustid/security
+
+# Lockfiles and dependency manifests — platform owns version movement.
+/package.json                    @gettrustid/platform
+/package-lock.json               @gettrustid/platform
+/pnpm-lock.yaml                  @gettrustid/platform
+/yarn.lock                       @gettrustid/platform
+/go.mod                          @gettrustid/platform
+/go.sum                          @gettrustid/platform
+/requirements.txt                @gettrustid/platform
+/requirements-*.txt              @gettrustid/platform
+/Pipfile                         @gettrustid/platform
+/Pipfile.lock                    @gettrustid/platform
+/poetry.lock                     @gettrustid/platform
+/Gemfile                         @gettrustid/platform
+/Gemfile.lock                    @gettrustid/platform
+
+# Container image definitions — both teams review (base image choice,
+# user/privilege settings, build-time secrets, attestation posture).
+/Dockerfile                      @gettrustid/platform @gettrustid/security
+/Dockerfile.*                    @gettrustid/platform @gettrustid/security
+
+# Terraform — platform owns infra-as-code.
+*.tf                             @gettrustid/platform
+*.tfvars                         @gettrustid/platform
+
+# Trivy ignore list — security owns scanner-suppression decisions.
+/.trivyignore                    @gettrustid/security
+
