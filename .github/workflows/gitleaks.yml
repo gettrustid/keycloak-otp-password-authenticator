@@ -92,7 +92,7 @@ jobs:
         # output for any findings and exits 1 if present. .gitleaksignore
         # entries are already honored by the previous step; this gate reads
         # whatever Gitleaks emitted post-ignore.
-        if: false
+        if: true
         shell: bash
         run: |
           set -euo pipefail
