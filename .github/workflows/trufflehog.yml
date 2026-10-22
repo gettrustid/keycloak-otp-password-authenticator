@@ -128,7 +128,7 @@ jobs:
       - name: Enforce block mode on verified findings
         # Gate step: non-zero exit if block_mode AND verified findings exist.
         # Reads the verified step's output (JSONL) and counts entries.
-        if: false
+        if: true
         shell: bash
         env:
           VERIFIED_RESULTS: ${{ steps.trufflehog_verified.outputs.results || '' }}
