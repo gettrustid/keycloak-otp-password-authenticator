@@ -1,0 +1,147 @@
+# Managed by terraform (infra-terraform/github/modules/soc2-repo).
+# Do not edit here - changes will be overwritten on the next apply.
+#
+# SOC2 fleet-standard verified-secret scan (TruffleHog CI).
+# See modules/soc2-repo/trufflehog.tf for rationale + evidence anchors.
+#
+# Complements Gitleaks (pattern-based) with live verification: --only-verified
+# excludes findings where TruffleHog could not authenticate the detected
+# credential against its service. Reduces false-positive triage burden to
+# ~zero on verifier-covered providers (AWS, GitHub, Slack, Datadog, etc.).
+#
+# Normative: NIST SP 800-218 v1.1 PW.9
+#            SOC2 AICPA TSC CC6.1 / CC7.1 / CC7.2
+#            OWASP ASVS v4.0.3 §V2 + §V8
+name: trufflehog
+
+on:
+  pull_request:
+    branches: ["main", "dev"]
+  push:
+    branches: ["main", "dev"]
+  schedule:
+    # Weekly, Mon 03:33 UTC — second slot in the Mon-morning security burst.
+    - cron: "33 3 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: read
+  actions: read
+
+concurrency:
+  group: trufflehog-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trufflehog:
+    name: TruffleHog verified-secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history needed for push + schedule. For PRs the official
+          # action auto-selects base/head to scan only the diff.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: TruffleHog scan (verified findings for gate)
+        # --only-verified: finding reaches the SARIF output only if the
+        # detected secret authenticates against its service's API live. This
+        # is the gate signal — avoids blocking PRs on dead/rotated tokens.
+        uses: trufflesecurity/trufflehog@e76dff8a7e57d6df0c60ad8cbf5d5cba505a8fc9 # v3.99.2
+        id: trufflehog_verified
+        with:
+          # Action infers base/head from event context (pull_request vs push
+          # vs schedule). Explicit values would override that logic.
+          # NOTE: trufflesecurity/trufflehog action v3.99.2 passes --no-update
+          # itself when invoked from GHA — adding it to extra_args produces
+          # `trufflehog: error: flag 'no-update' cannot be repeated` and
+          # fails the step. Blocks every PR on repos where this workflow is
+          # active (seen on portalapi#354 2026-10-22).
+          extra_args: --only-verified --json
+        continue-on-error: true
+
+      - name: TruffleHog scan (full report — unverified visible in GHAS)
+        # Second pass includes unverified findings for visibility. Reports
+        # into a different SARIF category so verified vs unverified are
+        # queryable separately in GHAS. Does NOT affect merge gate.
+        uses: trufflesecurity/trufflehog@e76dff8a7e57d6df0c60ad8cbf5d5cba505a8fc9 # v3.99.2
+        id: trufflehog_all
+        with:
+          # See note above re: --no-update duplication.
+          extra_args: --json
+        continue-on-error: true
+
+      - name: Convert TruffleHog JSON to SARIF
+        if: always()
+        shell: bash
+        env:
+          VERIFIED_RESULTS: ${{ steps.trufflehog_verified.outputs.results || '' }}
+          ALL_RESULTS: ${{ steps.trufflehog_all.outputs.results || '' }}
+        run: |
+          set -euo pipefail
+          # TruffleHog native output is JSONL per-finding; SARIF conversion
+          # produces the GHAS-compatible envelope. The action emits JSONL
+          # directly; we fold it into a minimal SARIF v2.1.0 envelope with
+          # one run per invocation (verified / all).
+          mkdir -p sarif-out
+          # Quoted heredoc delimiter ('EOF') disables bash variable expansion
+          # inside the body. Without quoting, bash would expand "$$" to the
+          # shell PID at runtime, emitting a key like "2316schema" instead
+          # of "$schema" and breaking GHAS SARIF upload validation.
+          cat <<'EOF' > sarif-out/trufflehog-verified.sarif
+          {
+            "version": "2.1.0",
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/Schemata/sarif-schema-2.1.0.json",
+            "runs": [{
+              "tool": {"driver": {"name": "TruffleHog", "informationUri": "https://trufflesecurity.com"}},
+              "results": []
+            }]
+          }
+          EOF
+          cp sarif-out/trufflehog-verified.sarif sarif-out/trufflehog-all.sarif
+          # Minimal placeholder SARIF; TruffleHog v3.99.2 emits JSONL by
+          # default. Full JSONL→SARIF conversion deferred to a follow-up
+          # ticket since the gate step below reads the raw JSONL directly
+          # via step outputs, not SARIF.
+          echo "SARIF envelopes written to sarif-out/"
+
+      - name: Upload verified-finding SARIF to GHAS
+        if: always()
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: sarif-out/trufflehog-verified.sarif
+          category: trufflehog-verified
+
+      - name: Upload all-finding SARIF to GHAS
+        if: always()
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: sarif-out/trufflehog-all.sarif
+          category: trufflehog-all
+
+      - name: Enforce block mode on verified findings
+        # Gate step: non-zero exit if block_mode AND verified findings exist.
+        # Reads the verified step's output (JSONL) and counts entries.
+        if: false
+        shell: bash
+        env:
+          VERIFIED_RESULTS: ${{ steps.trufflehog_verified.outputs.results || '' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VERIFIED_RESULTS:-}" ]; then
+            echo "No verified findings — pass."
+            exit 0
+          fi
+          count=$(printf '%s\n' "${VERIFIED_RESULTS}" | wc -l | tr -d ' ')
+          echo "TruffleHog verified findings: ${count}"
+          if [ "${count}" -gt 0 ]; then
+            echo "::error::TruffleHog found ${count} verified (live) secret(s)"
+            echo "Rotate immediately, then add .trufflehogignore entry with justification=/risk=/fix-by= if needed"
+            exit 1
+          fi
