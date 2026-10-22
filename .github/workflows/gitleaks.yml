@@ -1,0 +1,111 @@
+# Managed by terraform (infra-terraform/github/modules/soc2-repo).
+# Do not edit here - changes will be overwritten on the next apply.
+#
+# SOC2 fleet-standard secret scanning (Gitleaks).
+# See modules/soc2-repo/gitleaks.tf for rationale + evidence anchors.
+#
+# Scope: full-history secret scan on push + PR diff on pull_request. SARIF to
+# GHAS Security tab under category `gitleaks`. Complements GitHub Secret
+# Protection (push-time native patterns) + TruffleHog CI (verified findings).
+#
+# Audit-vs-block model:
+#   block_mode = false (default during rollout) → Gitleaks reports via SARIF
+#     but exit code is 0; PR not blocked.
+#   block_mode = true (after noise baseline) → exits 1 on any finding.
+#
+# Normative: NIST SP 800-218 v1.1 PW.9
+#            SOC2 AICPA TSC CC6.1 / CC7.1 / CC7.2
+#            OpenSSF Scorecard — Secret-Scanning (baseline)
+name: gitleaks
+
+on:
+  pull_request:
+    branches: ["main", "dev"]
+  push:
+    branches: ["main", "dev"]
+  schedule:
+    # Weekly, Mon 03:11 UTC — earliest in the fleet-standard Mon-morning
+    # security burst (CodeQL 04:17, poutine 04:45, SBOM 05:30, Dependabot
+    # 06:00, exception-lint 06:41, iac-sast 07:13). Gitleaks on full history
+    # of large repos can take 10+ minutes; schedule it first to finish before
+    # the batch fires.
+    - cron: "11 3 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write # SARIF upload to GHAS
+  pull-requests: read
+  actions: read
+
+concurrency:
+  group: gitleaks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gitleaks:
+    name: Gitleaks secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history needed for Gitleaks to find secrets committed
+          # before the current ref. For PRs, action auto-detects base and
+          # scans the diff; for push and scheduled, scans full history.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Run Gitleaks (SARIF — audit report)
+        # Uses the official Gitleaks action which handles PR-diff vs
+        # full-history mode selection via GITHUB_EVENT_NAME. Reports to
+        # SARIF unconditionally. Exit-code behavior controlled by the gate
+        # step below.
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          # No GitHub license key — public GHAS SARIF upload is free. Set
+          # GITLEAKS_ENABLE_UPLOAD_ARTIFACT to not persist report as artifact;
+          # SARIF is the authoritative output.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          GITLEAKS_ENABLE_SUMMARY: "true"
+          # Exit code 0 regardless of findings; the gate step below applies
+          # block/audit mode. This step is for GHAS reporting only.
+          GITLEAKS_NOTIFY_USER_LIST: ""
+        continue-on-error: true
+
+      - name: Upload SARIF to GHAS Security tab
+        # Upload unconditionally so findings surface even when the gate step
+        # later fails the job. Category `gitleaks` keeps these alerts
+        # distinct from push-protection native findings.
+        if: always() && hashFiles('results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: results.sarif
+          category: gitleaks
+
+      - name: Enforce block mode
+        # Second pass applies the severity gate. In audit mode (block_mode
+        # false) this step is a no-op. In block mode it checks the SARIF
+        # output for any findings and exits 1 if present. .gitleaksignore
+        # entries are already honored by the previous step; this gate reads
+        # whatever Gitleaks emitted post-ignore.
+        if: false
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f results.sarif ]; then
+            echo "No SARIF file produced — treating as pass (no findings)."
+            exit 0
+          fi
+          # Count results. Any finding at this point is post-.gitleaksignore,
+          # so it is a real violation.
+          findings=$(jq '[.runs[].results[]] | length' results.sarif)
+          echo "Gitleaks findings post-ignore: ${findings}"
+          if [ "${findings}" -gt 0 ]; then
+            echo "::error::Gitleaks found ${findings} secret(s) not covered by .gitleaksignore"
+            echo "Add exceptions with justification=/risk=/fix-by= per @.claude/rules/exception-management.md"
+            exit 1
+          fi
