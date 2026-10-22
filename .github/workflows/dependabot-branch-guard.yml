@@ -1,0 +1,125 @@
+# Managed by terraform (infra-terraform/github/modules/soc2-repo).
+# Do not edit here — changes will be overwritten on the next apply.
+#
+# Dependabot branch guard. Hard-fails any PR whose head branch starts with
+# `dependabot/` and whose diff touches files Dependabot has no business
+# modifying (build/bundler/lint/test configs, application source dirs).
+# Trivially passes for all non-Dependabot PRs so it can be a fleet-wide
+# required status check without noise.
+
+name: Dependabot branch guard
+
+on:
+  pull_request:
+  pull_request_target:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  dependabot-branch-guard:
+    name: dependabot-branch-guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Short-circuit for non-Dependabot PRs
+        id: scope
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          if ! printf '%s' "$HEAD_REF" | grep -q '^dependabot/'; then
+            echo "Not a Dependabot PR (head=$HEAD_REF); check passes vacuously."
+            echo "applies=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Dependabot PR detected (head=$HEAD_REF); enforcing file-path blocklist."
+          echo "applies=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout PR head + base
+        if: steps.scope.outputs.applies == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # fetch-depth: 0 so we can diff against the PR base sha even if it
+          # pre-dates the shallow fetch window.
+          fetch-depth: 0
+          # Use the merge ref so pull_request_target gives us the diff shape
+          # a normal pull_request would, without inheriting the PR's write
+          # scope on secrets (which we don't need and don't want).
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Enforce file-path blocklist on Dependabot PR
+        if: steps.scope.outputs.applies == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_ALERT_URL }}
+        run: |
+          set -euo pipefail
+
+          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+
+          echo "Changed files on $HEAD_REF:"
+          printf '%s\n' "$changed" | sed 's/^/  /'
+
+          # Blocklist. Paths Dependabot never writes to under normal
+          # operation; a Dependabot PR touching any of these is adversarial
+          # by definition. Patterns are anchored to the repo root (^).
+          #
+          # Rationale summary:
+          #   - build/bundler configs (webpack, vite, rollup, etc.) run at
+          #     build time and are the primary dropper vector in this attack
+          #     family (INC-2026-09-17, 2026-10-15 drill).
+          #   - lint/test/format configs (eslint, prettier, jest, vitest)
+          #     execute in CI and in editors; same dropper vector.
+          #   - application source dirs (src/, app/, lib/, etc.) contain
+          #     product code which Dependabot has no reason to edit.
+          #
+          # Dependabot's actual writes are: package.json, lockfiles,
+          # .github/workflows/* for GHA bumps, go.mod/go.sum, requirements.txt,
+          # Pipfile, Gemfile, Cargo.toml, composer.json. Nothing on this
+          # blocklist overlaps those paths.
+          blocked=$(printf '%s\n' "$changed" | grep -E \
+            '^(src|app|lib|components|pages|server|client|api|scripts|test|tests|e2e|cypress|playwright|features|cmd|internal|pkg)/|^(webpack|postcss|eslint|prettier|vite|rollup|next|nuxt|astro|tsup|esbuild|babel|svelte|tailwind|jest|vitest|stylelint|lint-staged|husky)\.config\.|^\.eslintrc(\.|$)|^\.prettierrc(\.|$)' \
+            || true)
+
+          if [ -z "$blocked" ]; then
+            echo "::notice::Dependabot PR touches only permitted paths — passing."
+            exit 0
+          fi
+
+          echo "::error::Dependabot PR $REPO#$PR_NUMBER touches restricted files:"
+          printf '%s\n' "$blocked" | sed 's/^/  - /'
+          echo "::error::Only package manifests, lockfiles, and workflow files are permitted on dependabot/* branches."
+          echo "::error::If this diff is legitimate (not a Dependabot bump), close this PR and re-open as a regular PR from a non-dependabot/* branch."
+
+          # Fire Slack alert if the webhook secret is configured. Skip silently
+          # if unset — the hard-fail of the check is the primary signal, Slack
+          # is defence in depth for the on-call rotation.
+          if [ -n "$SLACK_WEBHOOK_URL" ]; then
+            blocked_list=$(printf '%s' "$blocked" | tr '\n' ' ')
+            payload=$(cat <<JSON
+          {
+            "text": ":rotating_light: Dependabot branch guard tripped",
+            "attachments": [{
+              "color": "danger",
+              "fields": [
+                {"title": "Repo", "value": "$REPO", "short": true},
+                {"title": "PR", "value": "<$PR_URL|#$PR_NUMBER>", "short": true},
+                {"title": "Branch", "value": "$HEAD_REF", "short": false},
+                {"title": "Restricted paths touched", "value": "$blocked_list", "short": false},
+                {"title": "Context", "value": "This is the exact attack pattern from the 2026-10-15 tabletop drill and INC-2026-09-17. Investigate: compromised dev tool / MCP server / IDE extension on the PR author's workstation.", "short": false}
+              ]
+            }]
+          }
+          JSON
+          )
+            curl -sS -X POST "$SLACK_WEBHOOK_URL" \
+              -H 'Content-Type: application/json' \
+              --data "$payload" || echo "::warning::Slack webhook post failed; check continues."
+          fi
+
+          exit 1
