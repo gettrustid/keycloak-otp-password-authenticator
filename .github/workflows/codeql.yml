@@ -82,3 +82,110 @@ jobs:
           # Explicit output path so the gate step below can parse the SARIF.
           output: sarif-results
 
+      # In-job SARIF parse gate — CI-time fast-feedback layer.
+      #
+      # This step is BELT-AND-SUSPENDERS with the primary official gate
+      # implemented as github_repository_ruleset.codeql_scan_gate (see
+      # modules/soc2-repo/codeql-scan-ruleset.tf). Roles:
+      #
+      #   Ruleset (primary, GitHub-official per Docs):
+      #     Compares PR-introduced alerts to base branch; blocks merge on
+      #     NEW alerts at or above security_alerts_threshold. Existing
+      #     debt is grandfathered. Native GHAS UI triage lifecycle.
+      #
+      #   This step (fast-feedback secondary):
+      #     Parses SARIF at CI time and exits 1 on ANY unsuppressed
+      #     finding at or above the same threshold. Catches pre-existing
+      #     debt (which the ruleset would grandfather) so the SSDLC
+      #     policy's "no critical open at release" clause is enforced,
+      #     not just "no new critical introduced." Also gives the
+      #     developer immediate rule-id + file:line in the Actions log
+      #     instead of requiring a Security tab visit.
+      #
+      # Threshold semantics (matches vuln_scan_severity_threshold and
+      # the ruleset security_alerts_threshold):
+      #   "CRITICAL"      → block on security-severity ≥ 9.0  (ruleset: "critical")
+      #   "CRITICAL,HIGH" → block on security-severity ≥ 7.0  (ruleset: "high_or_higher")
+      #
+      # Ignores suppressed alerts (`.suppressions | length > 0`) so that
+      # documented exception dismissals via the GHAS UI don't re-trigger
+      # the gate on every PR. Matches the ruleset's own behavior — an
+      # alert dismissed via GHAS UI is excluded from both gates.
+      # Exception governance: see SSDLC policy §Exceptions (documented
+      # risk + fix timeline required).
+      #
+      # Cite: GitHub Docs — Configuration options for code scanning
+      # https://docs.github.com/en/code-security/code-scanning/managing-your-code-scanning-configuration/configuration-options-for-code-scanning
+      # accessed 2026-09-26 — GRADE: HIGH (GitHub official).
+      # SARIF v2.1.0 §3.27.19 (result.suppressions),
+      # https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/sarif-v2.1.0-os.html
+      # accessed 2026-09-26 — GRADE: HIGH (OASIS standards body).
+      # security-severity property: GitHub Docs — CodeQL query metadata,
+      # https://codeql.github.com/docs/writing-codeql-queries/metadata-for-codeql-queries/
+      # accessed 2026-09-26 — GRADE: HIGH (GitHub official).
+      - name: Gate on CodeQL security findings (CRITICAL,HIGH)
+        env:
+          THRESHOLD: "CRITICAL,HIGH"
+        run: |
+          set -euo pipefail
+
+          case "$THRESHOLD" in
+            "CRITICAL")      MIN_SEV="9.0" ;;
+            "CRITICAL,HIGH") MIN_SEV="7.0" ;;
+            *) echo "::error::Unknown threshold '$THRESHOLD'"; exit 1 ;;
+          esac
+
+          SARIF=$(find sarif-results -maxdepth 2 -name '*.sarif' 2>/dev/null | head -1)
+          if [ -z "$SARIF" ] || [ ! -f "$SARIF" ]; then
+            echo "::warning::No SARIF file found at sarif-results/*.sarif; skipping gate"
+            exit 0
+          fi
+
+          # Extract unsuppressed findings whose rule's security-severity
+          # meets or exceeds the threshold. Rules table lives at
+          # runs[].tool.driver.rules; results reference by ruleId (v1) or
+          # ruleIndex (v2) — handle both.
+          BLOCKING=$(jq --arg min "$MIN_SEV" '
+            [ .runs[]?
+              | . as $run
+              | .results[]?
+              | select((.suppressions // []) | length == 0)
+              | (
+                  (.ruleId // "") as $rid |
+                  (.ruleIndex // -1) as $ridx |
+                  (
+                    ($run.tool.driver.rules // [])
+                    | if $ridx >= 0 then .[$ridx]
+                      else map(select(.id == $rid)) | .[0]
+                      end
+                  )
+                ) as $rule
+              | ($rule.properties["security-severity"] // "0") | tonumber
+              | select(. >= ($min | tonumber))
+            ] | length' "$SARIF")
+
+          echo "CodeQL: $BLOCKING unsuppressed finding(s) at security-severity ≥ $MIN_SEV ($THRESHOLD)"
+
+          if [ "$BLOCKING" -gt 0 ]; then
+            echo "::error::CodeQL blocking gate failed: $BLOCKING finding(s) at or above security-severity $MIN_SEV. Resolve or document exception dismissal in the Security tab before merging."
+            # Print top offenders for triage
+            jq --arg min "$MIN_SEV" -r '
+              .runs[]?
+              | . as $run
+              | .results[]?
+              | select((.suppressions // []) | length == 0)
+              | (
+                  (.ruleId // "") as $rid |
+                  (.ruleIndex // -1) as $ridx |
+                  (
+                    ($run.tool.driver.rules // [])
+                    | if $ridx >= 0 then .[$ridx]
+                      else map(select(.id == $rid)) | .[0]
+                      end
+                  )
+                ) as $rule
+              | select(($rule.properties["security-severity"] // "0" | tonumber) >= ($min | tonumber))
+              | "  - \($rule.id // "?") [sev=\($rule.properties["security-severity"] // "?")]: \(.message.text // "") @ \(.locations[0].physicalLocation.artifactLocation.uri // "?"):\(.locations[0].physicalLocation.region.startLine // "?")"
+            ' "$SARIF" | head -20
+            exit 1
+          fi
