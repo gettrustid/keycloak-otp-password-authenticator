@@ -1,0 +1,121 @@
+# Managed by terraform (infra-terraform/github/modules/soc2-repo).
+# Do not edit here - changes will be overwritten on the next apply.
+#
+# GH-5 — committer-identity verification for dependabot/** branches.
+# See modules/soc2-repo/committer-verification.tf for rationale.
+#
+# Direct remediation for INC-2026-09-17 (HellFoxx Dependabot hijack).
+# Non-dependabot PRs pass immediately (job short-circuits on head ref).
+#
+# Normative: NIST SP 800-218 v1.1 PO.3 / PS.2 / PW.1
+#            SLSA v1.0 Build L2 (signed commits as source anchor)
+#            SOC2 AICPA TSC CC6.1 / CC6.6 / CC7.1 / CC8.1
+name: committer-verification
+
+on:
+  pull_request:
+    branches: ["main", "dev"]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to re-verify"
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  pull-requests: read
+  actions: read
+
+concurrency:
+  group: committer-verification-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  committer-verification:
+    name: committer-verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Determine scope
+        # Only enforce when the PR head ref is dependabot/** — for all
+        # other refs, this job is a trivial pass (so the required-status-
+        # check wiring works fleet-wide without blocking human PRs).
+        id: scope
+        shell: bash
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER_INPUT: ${{ inputs.pr_number }}
+          PR_NUMBER_EVENT: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # Allow manual re-verify via workflow_dispatch.
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ]; then
+            echo "pr_number=${PR_NUMBER_INPUT}" >> "${GITHUB_OUTPUT}"
+            echo "enforce=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          # Only enforce on dependabot/** head refs.
+          if [[ "${HEAD_REF}" == dependabot/* ]]; then
+            echo "pr_number=${PR_NUMBER_EVENT}" >> "${GITHUB_OUTPUT}"
+            echo "enforce=true" >> "${GITHUB_OUTPUT}"
+            echo "Enforcing GH-5 on dependabot/** PR #${PR_NUMBER_EVENT}"
+          else
+            echo "pr_number=" >> "${GITHUB_OUTPUT}"
+            echo "enforce=false" >> "${GITHUB_OUTPUT}"
+            echo "Non-dependabot PR — skipping GH-5 (passes trivially)."
+          fi
+
+      - name: Verify every commit on PR is GitHub-signed as Dependabot
+        if: steps.scope.outputs.enforce == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.scope.outputs.pr_number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Fetch the full commit list for the PR. Walk each one and assert:
+          #   .commit.committer.name == "GitHub"
+          #   .commit.verification.verified == true
+          #   .commit.verification.reason == "valid"
+          # Fails hard on first violation; prints the offending SHA + fields.
+          page=1
+          found_violation=0
+          while :; do
+            commits=$(gh api \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${REPO}/pulls/${PR_NUMBER}/commits?per_page=100&page=${page}")
+            count=$(echo "${commits}" | jq 'length')
+            if [ "${count}" -eq 0 ]; then
+              break
+            fi
+            # Iterate using a while-read loop; shell + jq handle it safely.
+            echo "${commits}" | jq -c '.[]' | while read -r commit; do
+              sha=$(echo "${commit}" | jq -r '.sha')
+              committer_name=$(echo "${commit}" | jq -r '.commit.committer.name // "null"')
+              verified=$(echo "${commit}" | jq -r '.commit.verification.verified // false')
+              reason=$(echo "${commit}" | jq -r '.commit.verification.reason // "null"')
+              echo "sha=${sha} committer_name=${committer_name} verified=${verified} reason=${reason}"
+              if [ "${committer_name}" != "GitHub" ] || [ "${verified}" != "true" ] || [ "${reason}" != "valid" ]; then
+                echo "::error ::GH-5 VIOLATION on commit ${sha}: committer_name='${committer_name}' verified='${verified}' reason='${reason}' — expected GitHub/true/valid"
+                echo "This indicates the dependabot/** branch has non-Dependabot commits. See INC-2026-09-17."
+                exit 1
+              fi
+            done
+            # Loop body runs in subshell — propagate via marker file.
+            if [ -f .gh5_violation ]; then
+              found_violation=1
+              break
+            fi
+            if [ "${count}" -lt 100 ]; then
+              break
+            fi
+            page=$((page + 1))
+          done
+          if [ "${found_violation}" -eq 1 ]; then
+            exit 1
+          fi
+          echo "GH-5 passed: all commits are GitHub-infrastructure-signed Dependabot commits."

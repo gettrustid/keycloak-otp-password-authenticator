@@ -4,7 +4,12 @@
 # SOC2 fleet-standard Dependabot configuration.
 # See modules/soc2-repo/dependabot.tf for rationale + evidence anchors.
 #
-# Cooldown: GitHub Changelog 2026-07-14 (default 3d, security-exempt)
+# Cooldown: GitHub Changelog 2026-07-14 (7d fleet-standard default,
+#           30d majors, 7d minors, 7d patches; security-exempt).
+#           Bumped from 3d→7d 2026-09-26 post-INC-2026-09-17 (HellFoxx
+#           Dependabot-branch hijack) to widen the yank/report window.
+#           See .aiwg/security/scanning-supply-chain-defense/
+#           dependabot-hardening-addendum.md §1.
 # Grouping: GitHub Changelog 2024-03-28 (grouped security updates GA)
 # Normative: OpenSSF Scorecard Dependency-Update-Tool (High risk)
 #            NIST SP 800-218 v1.1 PW.4.4
@@ -20,7 +25,7 @@ updates:
     reviewers:
       - "gettrustid/security"
     cooldown:
-      default-days: 3
+      default-days: 7
     groups:
       gha-all:
         applies-to: version-updates

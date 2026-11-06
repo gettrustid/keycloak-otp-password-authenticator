@@ -1,0 +1,79 @@
+# Managed by terraform (infra-terraform/github/modules/soc2-repo).
+# Do not edit here - changes will be overwritten on the next apply.
+#
+# SOC2 fleet-standard GitHub Actions workflow audit (zizmor).
+# See modules/soc2-repo/zizmor.tf for rationale + evidence anchors.
+#
+# Complements poutine (CI/CD supply-chain scanner, poutine.tf). Different rule
+# banks, different maintainer teams — dual coverage for workflow security.
+#
+# Normative: NIST SP 800-218 v1.1 PS.1 + PO.5
+#            SLSA v1.0 Build Level 2/3
+#            OWASP Top 10 CI/CD Security Risks
+#            SOC2 AICPA TSC CC6.1 / CC7.1 / CC8.1
+name: zizmor
+
+on:
+  pull_request:
+    branches: ["main", "dev"]
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+      - ".github/zizmor.yml"
+  push:
+    branches: ["main", "dev"]
+    paths:
+      - ".github/workflows/**"
+      - ".github/actions/**"
+  schedule:
+    # Weekly, Mon 03:55 UTC — third slot in the Mon-morning security burst
+    # (gitleaks 03:11, trufflehog 03:33, zizmor 03:55, codeql 04:17, ...).
+    - cron: "55 3 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: read
+  actions: read
+
+concurrency:
+  group: zizmor-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zizmor:
+    name: zizmor workflow audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Zizmor needs only HEAD; no history dependency.
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Run zizmor
+        # The official zizmor-action handles SARIF emission and (with
+        # min-severity) fail-on-finding behavior. `min_severity: none` is the
+        # audit-mode default; flip to `high` or `error` after noise baseline.
+        uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          min-severity: none
+          # SARIF emission is on by default and the action handles upload
+          # internally if `advanced-security-upload` is true; we set it to
+          # false and do the upload ourselves to a fixed category.
+          advanced-security: false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Upload zizmor SARIF to GHAS Security tab
+        # Action writes results.sarif in workspace root when SARIF is enabled.
+        if: always() && hashFiles('results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          sarif_file: results.sarif
+          category: zizmor

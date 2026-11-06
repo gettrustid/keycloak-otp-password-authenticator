@@ -1,0 +1,63 @@
+# Managed by terraform (infra-terraform/github/modules/soc2-repo).
+# Do not edit here - changes will be overwritten on the next apply.
+#
+# SOC2 fleet-standard Harden-Runner audit baseline (StepSecurity).
+# See modules/soc2-repo/harden-runner.tf for rationale + phase-2 roadmap.
+#
+# This workflow is itself fully hardened; it establishes a baseline of what
+# a minimal checkout + no-op job touches. Fleet integration into other
+# workflows happens in phase 2.
+#
+# Normative: NIST SP 800-218 v1.1 PO.5 + PW.6
+#            SLSA v1.0 Build L2
+#            SOC2 AICPA TSC CC6.1 / CC6.6 / CC7.1 / CC7.2
+name: harden-runner-audit
+
+on:
+  push:
+    branches: ["main", "dev"]
+  schedule:
+    - cron: "30 2 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: harden-runner-audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    name: Harden-Runner audit baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Harden Runner
+        # MUST be first step of the job per Harden-Runner docs — the eBPF
+        # probe is attached at this point and all subsequent egress is
+        # monitored.
+        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          # egress-policy: audit → log all egress, do not block
+          # egress-policy: block → fail step on egress not in allowed-endpoints
+          egress-policy: audit
+          disable-sudo: true
+          disable-file-monitoring: false
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Baseline summary
+        # Trivial pass-step; the real signal is in Harden-Runner telemetry
+        # posted to the StepSecurity dashboard + the per-job report
+        # workflow-run annotation.
+        shell: bash
+        run: |
+          echo "Harden-Runner audit baseline captured for commit ${{ github.sha }}"
+          echo "Review runtime telemetry at https://app.stepsecurity.io/"
