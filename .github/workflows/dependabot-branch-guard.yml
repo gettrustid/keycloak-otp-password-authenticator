@@ -35,23 +35,10 @@ jobs:
           echo "Dependabot PR detected (head=$HEAD_REF); enforcing file-path blocklist."
           echo "applies=true" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout PR head + base
-        if: steps.scope.outputs.applies == 'true'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          # fetch-depth: 0 so we can diff against the PR base sha even if it
-          # pre-dates the shallow fetch window.
-          fetch-depth: 0
-          # Use the merge ref so pull_request_target gives us the diff shape
-          # a normal pull_request would, without inheriting the PR's write
-          # scope on secrets (which we don't need and don't want).
-          ref: ${{ github.event.pull_request.head.sha }}
-
       - name: Enforce file-path blocklist on Dependabot PR
         if: steps.scope.outputs.applies == 'true'
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_REF: ${{ github.head_ref }}
@@ -60,7 +47,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          # This guard deliberately never checks out PR code: it runs under
+          # pull_request_target (privileged token/secrets), so executing or
+          # even fetching untrusted PR content here would be unsafe. Changed
+          # files are listed through the REST API instead. previous_filename
+          # is included so renames out of a blocked path are also caught.
+          changed=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)' | sort -u)
 
           echo "Changed files on $HEAD_REF:"
           printf '%s\n' "$changed" | sed 's/^/  /'
