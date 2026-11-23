@@ -39,7 +39,7 @@ jobs:
         # MUST be first step of the job per Harden-Runner docs — the eBPF
         # probe is attached at this point and all subsequent egress is
         # monitored.
-        uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a # v2.22.4
         with:
           # egress-policy: audit → log all egress, do not block
           # egress-policy: block → fail step on egress not in allowed-endpoints
