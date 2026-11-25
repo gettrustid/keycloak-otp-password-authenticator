@@ -81,7 +81,7 @@ jobs:
         # later fails the job. Category `gitleaks` keeps these alerts
         # distinct from push-protection native findings.
         if: always() && hashFiles('results.sarif') != ''
-        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        uses: github/codeql-action/upload-sarif@74c1aea9df7c0f02e9b7bfe4a8935abf2e5e3aa6 # v3.39.5
         with:
           sarif_file: results.sarif
           category: gitleaks
