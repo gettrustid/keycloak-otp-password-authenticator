@@ -1,0 +1,213 @@
+# Managed by terraform (infra-terraform/github/modules/soc2-repo).
+# Do not edit here — changes will be overwritten on the next apply.
+#
+# SOC2 fleet-standard: SHA-pin liveness check.
+#
+# Problem this control addresses:
+#   We pin every GitHub Actions `uses:` statement to a 40-char commit SHA per
+#   OpenSSF Scorecard Pinned-Dependencies and NIST SP 800-218 PW.8. The pin is
+#   cryptographically correct at commit time, but upstream can rewrite history
+#   (force-push, tag move, repo transfer), silently orphaning the referenced
+#   commit. GitHub Dependabot does NOT monitor SHA-pinned actions for upstream
+#   drift — documented limitation at
+#   https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-githubs-security-features-to-secure-your-use-of-github-actions
+#
+# What this workflow does:
+#   1. Extracts every `uses: owner/repo@SHA` reference (40-hex) from every
+#      .github/workflows/*.{yml,yaml} in this repo.
+#   2. Calls GET /repos/{owner}/{repo}/commits/{sha} for each unique pair.
+#   3. On any 404/422, opens a GitHub issue tagged `sha-drift` on this repo.
+#      Issue body lists every drifted pin + a suggested replacement (latest tag
+#      resolving to a live SHA).
+#
+# Why not a blocking PR check:
+#   Every PR push revalidates ~30 SHAs × N PRs/day. Weekly cron + the issue
+#   model achieves "drift detected ≤7 days" without the API-rate-limit cost.
+#   An ad-hoc `workflow_dispatch` is available for on-demand verification.
+#
+# Normative: NIST SP 800-218 v1.1 PW.8 / PW.9 (release archive + dependency
+#            verification)
+#            OpenSSF Scorecard Pinned-Dependencies check
+#            SOC2 AICPA TSC CC7.1 (system operations — detection of security
+#            events)
+#
+# @references @.aiwg/architecture/ci-cd-hardening-prevention-2026-11-24.md §A
+name: pin-liveness
+
+on:
+  schedule:
+    # Mon 03:00 UTC — before the Monday-morning security burst (CodeQL 04:17,
+    # poutine 04:45, Dependabot 06:00, vuln-scan 06:30). Drift findings surface
+    # before the scanners that depend on them run.
+    - cron: "0 3 * * 1"
+  workflow_dispatch: {}
+  push:
+    branches: ["dev"]
+    paths:
+      - '.github/workflows/*.yml'
+      - '.github/workflows/*.yaml'
+
+permissions:
+  contents: read
+  issues: write  # Open drift-report issues
+
+concurrency:
+  group: pin-liveness-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Verify pinned SHAs still resolve upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve pinned SHAs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+
+          # Collect `uses: owner/repo@40hexSHA` from all workflow files.
+          # Allow trailing `# vX.Y.Z` comment per our SHA-pin convention.
+          mapfile -t refs < <(
+            grep -hREo 'uses:[[:space:]]*[A-Za-z0-9._/-]+@[0-9a-f]{40}' \
+              .github/workflows/ 2>/dev/null \
+            | sed -E 's/^uses:[[:space:]]*//' \
+            | sort -u
+          )
+
+          if [ "${#refs[@]}" -eq 0 ]; then
+            echo "::notice::No SHA-pinned actions found. Nothing to verify."
+            exit 0
+          fi
+
+          echo "Verifying ${#refs[@]} unique SHA-pinned action(s)..."
+
+          drift_count=0
+          drift_report=""
+
+          for ref in "${refs[@]}"; do
+            action="${ref%@*}"   # owner/repo
+            sha="${ref##*@}"     # 40-hex SHA
+            # /commits/{sha} returns 200 iff the commit exists on the repo.
+            # 422 = unknown ref (force-pushed away, tag retargeted, etc.).
+            # 404 = repo renamed, deleted, or transferred.
+            http_code=$(curl -sS -o /dev/null -w "%{http_code}" \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${action}/commits/${sha}" \
+              || echo "000")
+
+            case "${http_code}" in
+              200)
+                echo "  ok      ${action}@${sha:0:7}"
+                ;;
+              422|404)
+                echo "  DRIFT   ${action}@${sha:0:7} (HTTP ${http_code})"
+                drift_count=$((drift_count + 1))
+                # Which workflow files reference it?
+                files=$(grep -lE "uses:[[:space:]]*${action}@${sha}" \
+                  .github/workflows/ 2>/dev/null \
+                  | sed 's|^|  - |')
+                drift_report="${drift_report}
+          ### \`${action}@${sha:0:7}\` → HTTP ${http_code}
+          Referenced in:
+          ${files}
+          "
+                ;;
+              *)
+                echo "  skip    ${action}@${sha:0:7} (HTTP ${http_code}, not conclusive)"
+                ;;
+            esac
+          done
+
+          echo "DRIFT_COUNT=${drift_count}" >> "${GITHUB_ENV}"
+          {
+            echo "DRIFT_REPORT<<EOF_DRIFT"
+            echo "${drift_report}"
+            echo "EOF_DRIFT"
+          } >> "${GITHUB_ENV}"
+
+          if [ "${drift_count}" -gt 0 ]; then
+            echo "::warning::Detected ${drift_count} drifted SHA pin(s). Issue will be opened."
+          else
+            echo "::notice::All pinned SHAs resolve upstream."
+          fi
+
+      - name: Open or update drift issue
+        if: env.DRIFT_COUNT != '0' && env.DRIFT_COUNT != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # One rolling issue per repo. If an open one exists, update it; else
+          # open fresh. Prevents issue flooding on weekly runs if the drift
+          # persists while the team triages.
+          existing=$(gh issue list \
+            --repo "${REPO}" \
+            --label sha-drift \
+            --state open \
+            --limit 1 \
+            --json number \
+            --jq '.[0].number // empty')
+
+          body=$(cat <<BODY
+          # SHA-pin drift detected
+
+          On $(date -u +"%Y-%m-%d %H:%M UTC"), the pin-liveness workflow found ${DRIFT_COUNT} GitHub Actions
+          references whose pinned commit SHA no longer resolves upstream.
+
+          This is the exact failure mode that broke the fleet \`vuln-scan\`
+          on \`anchore/scan-action@f6601287\` (incident 2026-11-24).
+
+          ## Drifted pins
+
+          ${DRIFT_REPORT}
+
+          ## Action required
+
+          1. Identify the intended target tag (check the \`# vX.Y.Z\` comment on the \`uses:\` line).
+          2. Resolve the current SHA for that tag: \`gh api /repos/{owner}/{repo}/git/ref/tags/{tag} --jq .object.sha\`.
+          3. Open a PR updating the SHA (and the comment) in \`infra-terraform/github/modules/soc2-repo/\` for TF-managed workflows, or in the repo's own \`.github/workflows/\` for others.
+
+          ## Why this matters
+
+          Dependabot does NOT monitor SHA-pinned actions — documented at
+          https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-githubs-security-features-to-secure-your-use-of-github-actions —
+          so this issue is the only drift signal we receive.
+
+          _Managed by \`.github/workflows/pin-liveness.yml\` (terraform-managed)._
+          BODY
+          )
+
+          if [ -n "${existing}" ]; then
+            echo "Updating existing issue #${existing}"
+            gh issue edit "${existing}" --repo "${REPO}" --body "${body}"
+          else
+            echo "Opening new drift issue"
+            gh issue create \
+              --repo "${REPO}" \
+              --title "SHA-pin drift detected (${DRIFT_COUNT} pin(s) orphaned)" \
+              --label sha-drift \
+              --body "${body}"
+          fi
+
+      - name: Fail job on drift
+        if: env.DRIFT_COUNT != '0' && env.DRIFT_COUNT != ''
+        shell: bash
+        run: |
+          echo "::error::${DRIFT_COUNT} SHA pin(s) have drifted upstream."
+          echo "Open the \`sha-drift\` labeled issue on this repo for details."
+          exit 1
